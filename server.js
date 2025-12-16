@@ -7,7 +7,9 @@ const express = require('express');
 const fetch = require('node-fetch');
 
 const app = express();
-app.use(express.json());
+// TradingView (or intermediaries) may send `text/plain` even when the content is JSON.
+// Capture the raw body for /webhook and parse it ourselves so we never forward `{}` by accident.
+app.use('/webhook', express.text({ type: '*/*' }));
 
 const TARGET_URL =
   process.env.TARGET_URL || 'http://localhost:3000/webhook';
@@ -31,8 +33,13 @@ app.use((req, res, next) => {
 
   log(`#${id} IN`, method, url);
   log(`#${id} headers`, JSON.stringify(headers));
-  if (body && Object.keys(body).length > 0) {
-    log(`#${id} body`, JSON.stringify(body));
+  if (typeof body === 'string') {
+    const trimmed = body.trim();
+    if (trimmed) log(`#${id} bodyText`, trimmed.slice(0, 500));
+  } else if (body && typeof body === 'object' && Object.keys(body).length > 0) {
+    log(`#${id} bodyJson`, JSON.stringify(body).slice(0, 500));
+  } else if (body != null) {
+    log(`#${id} bodyType`, typeof body);
   }
 
   res.on('finish', () => {
@@ -48,15 +55,30 @@ app.get('/health', (_req, res) => {
 
 app.post('/webhook', async (req, res) => {
   const id = reqCounter; // current request id from middleware
-  const body = req.body;
+  const rawBody = typeof req.body === 'string' ? req.body : JSON.stringify(req.body);
+  const trimmed = rawBody.trim();
+
+  let forwardContentType = 'text/plain; charset=utf-8';
+  let forwardBody = rawBody;
+
+  // If it looks like JSON and parses, forward as JSON to preserve structure.
+  if (trimmed.startsWith('{') || trimmed.startsWith('[') || trimmed.startsWith('"')) {
+    try {
+      JSON.parse(trimmed);
+      forwardContentType = 'application/json';
+      forwardBody = trimmed;
+    } catch {
+      // Keep as text/plain
+    }
+  }
 
   log(`#${id} forwarding to FSM`, TARGET_URL);
 
   try {
     const resp = await fetch(TARGET_URL, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body),
+      headers: { 'Content-Type': forwardContentType },
+      body: forwardBody,
     });
 
     const text = await resp.text();
